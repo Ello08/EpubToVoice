@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       epub_path:
-        description: "EPUB dosyası yolu veya glob deseni (örn. out/*.epub, out/kitap.epub)"
+        description: "EPUB dosyası yolu (tek bir dosyaya çözülmeli, örn. out/*.epub veya out/kitap.epub)"
         required: true
         default: "out/*.epub"
         type: string
@@ -21,20 +21,37 @@ on:
         required: false
         default: "+0%"
         type: string
+      chapters_per_job:
+        description: "Her paralel job'ın işleyeceği bölüm sayısı"
+        required: true
+        default: "100"
+        type: string
+      max_parallel:
+        description: "Aynı anda çalışacak en fazla job sayısı (ücretsiz planda üst sınır 20)"
+        required: true
+        default: "10"
+        type: string
 
 permissions:
   contents: read
 
+env:
+  PYTHONUNBUFFERED: "1"
+
 jobs:
-  convert:
+  # ---------------------------------------------------------------------
+  # 1) Bölüm sayısını bul ve matrix'i üret
+  # ---------------------------------------------------------------------
+  prepare:
+    name: Planla
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 15
     env:
-      PYTHONUNBUFFERED: "1"
-      # Girdiler shell komutuna doğrudan gömülmez (script injection'a karşı)
       EPUB_PATH: ${{ inputs.epub_path }}
-      VOICE: ${{ inputs.voice }}
-      RATE: ${{ inputs.rate }}
+      PER_JOB: ${{ inputs.chapters_per_job }}
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      total: ${{ steps.plan.outputs.total }}
 
     steps:
       - name: Depoyu çek
@@ -50,19 +67,86 @@ jobs:
           python -m pip install --upgrade pip
           pip install "edge-tts>=7.0.0" ebooklib beautifulsoup4 lxml
 
-      - name: EPUB'u sesli kitaba dönüştür
+      - name: Bölümleri say ve matrix oluştur
+        id: plan
+        run: |
+          set -euo pipefail
+          total="$(python epub_to_audio.py --input "$EPUB_PATH" --count-chapters)"
+          if [ "${total:-0}" -lt 1 ]; then
+            echo "::error::Seslendirilecek bölüm bulunamadı."
+            exit 1
+          fi
+
+          matrix="$(python - "$total" "$PER_JOB" <<'PY'
+          import json, sys
+          total, per = int(sys.argv[1]), max(1, int(sys.argv[2]))
+          include = [
+              {"shard": n, "start": start, "end": min(start + per - 1, total)}
+              for n, start in enumerate(range(1, total + 1, per), 1)
+          ]
+          print(json.dumps({"include": include}))
+          PY
+          )"
+
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+          shards="$(python -c 'import json,sys; print(len(json.loads(sys.argv[1])["include"]))' "$matrix")"
+          {
+            echo "### Plan"
+            echo "- Toplam bölüm: **$total**"
+            echo "- Paralel job sayısı: **$shards** (job başına en fazla $PER_JOB bölüm)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------
+  # 2) Her aralığı ayrı bir runner'da seslendir
+  # ---------------------------------------------------------------------
+  convert:
+    name: Parça ${{ matrix.shard }} (bölüm ${{ matrix.start }}-${{ matrix.end }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false   # bir parça patlasa da diğerleri devam etsin
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      # Girdiler shell komutuna doğrudan gömülmez (script injection'a karşı)
+      EPUB_PATH: ${{ inputs.epub_path }}
+      VOICE: ${{ inputs.voice }}
+      RATE: ${{ inputs.rate }}
+      START: ${{ matrix.start }}
+      END: ${{ matrix.end }}
+
+    steps:
+      - name: Depoyu çek
+        uses: actions/checkout@v5
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bağımlılıkları kur
+        run: |
+          python -m pip install --upgrade pip
+          pip install "edge-tts>=7.0.0" ebooklib beautifulsoup4 lxml
+
+      - name: Bölüm aralığını sesli kitaba dönüştür
         run: |
           python epub_to_audio.py \
             --input "$EPUB_PATH" \
             --voice "$VOICE" \
             --rate "${RATE:-+0%}" \
+            --start "$START" \
+            --end "$END" \
             --output-dir audio_out
 
       - name: Özet yaz
         if: always()
         run: |
           {
-            echo "### Oluşturulan ses dosyaları"
+            echo "### Parça ${{ matrix.shard }} (bölüm $START-$END)"
             echo ""
             if [ -d audio_out ] && [ -n "$(find audio_out -name '*.mp3' -print -quit)" ]; then
               find audio_out -name '*.mp3' -printf '- `%P` — %k KiB\n' | sort
@@ -75,8 +159,27 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: audiobook-${{ github.run_id }}
+          name: audio-${{ github.run_id }}-part-${{ matrix.shard }}
           path: audio_out/
           if-no-files-found: warn
           retention-days: 7
           compression-level: 0   # MP3 zaten sıkıştırılmış
+
+  # ---------------------------------------------------------------------
+  # 3) Tüm parçaları tek artifact'ta birleştir
+  # ---------------------------------------------------------------------
+  merge:
+    name: Artifact'ları birleştir
+    needs: [prepare, convert]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Parçaları tek artifact'ta topla
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: audiobook-${{ github.run_id }}
+          pattern: audio-${{ github.run_id }}-part-*
+          delete-merged: true
+          retention-days: 7
+          compression-level: 0
