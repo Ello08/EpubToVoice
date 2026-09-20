@@ -1,0 +1,82 @@
+name: EPUB to Audio (MP3)
+
+on:
+  workflow_dispatch:
+    inputs:
+      epub_path:
+        description: "EPUB dosyası yolu veya glob deseni (örn. out/*.epub, out/kitap.epub)"
+        required: true
+        default: "out/*.epub"
+        type: string
+      voice:
+        description: "Ses seçeneği"
+        required: true
+        default: "tr-TR-AhmetNeural"
+        type: choice
+        options:
+          - tr-TR-AhmetNeural
+          - tr-TR-EmelNeural
+      rate:
+        description: "Konuşma hızı (örn. +0%, +10%, -15%)"
+        required: false
+        default: "+0%"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      PYTHONUNBUFFERED: "1"
+      # Girdiler shell komutuna doğrudan gömülmez (script injection'a karşı)
+      EPUB_PATH: ${{ inputs.epub_path }}
+      VOICE: ${{ inputs.voice }}
+      RATE: ${{ inputs.rate }}
+
+    steps:
+      - name: Depoyu çek
+        uses: actions/checkout@v5
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bağımlılıkları kur
+        run: |
+          python -m pip install --upgrade pip
+          pip install "edge-tts>=7.0.0" ebooklib beautifulsoup4 lxml
+
+      - name: EPUB'u sesli kitaba dönüştür
+        run: |
+          python epub_to_audio.py \
+            --input "$EPUB_PATH" \
+            --voice "$VOICE" \
+            --rate "${RATE:-+0%}" \
+            --output-dir audio_out
+
+      - name: Özet yaz
+        if: always()
+        run: |
+          {
+            echo "### Oluşturulan ses dosyaları"
+            echo ""
+            if [ -d audio_out ] && [ -n "$(find audio_out -name '*.mp3' -print -quit)" ]; then
+              find audio_out -name '*.mp3' -printf '- `%P` — %k KiB\n' | sort
+            else
+              echo "_Hiç MP3 üretilmedi._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: MP3 dosyalarını artifact olarak yükle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audiobook-${{ github.run_id }}
+          path: audio_out/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0   # MP3 zaten sıkıştırılmış
